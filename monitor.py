@@ -5,12 +5,10 @@ import aiohttp
 import zipfile
 import urllib.parse
 from io import BytesIO
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from playwright.async_api import async_playwright
 
 # --- CONFIGURATION ---
-
-# Ensure this is set in your environment variables or replace with the actual URL string for testing
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") 
 
 EXAM_CONFIG = {
@@ -20,7 +18,6 @@ EXAM_CONFIG = {
     "held_month": "November",
     "held_year": "2025"
 }
-
 REG_LIST = [
     "22156148040", "22156148042", "22156148018", "22156148051", "22156148012",
     "22156148001", "22156148002", "22156148003", "22156148004", "22156148005",
@@ -58,12 +55,15 @@ REG_LIST = [
     "23102148904", "23102148905"
 ]
 
-# --- RESTORED USER SETTINGS ---
-CHECK_INTERVAL = 5          # Check every 5 seconds (Fast loop)
-CONTINUOUS_DURATION = 900   # Run for 15 minutes max
-CONCURRENCY_LIMIT = 6       # 6 Browsers
-SCHEDULED_INTERVAL = 600    # "I am alive" hourly message
-DOWN_REMINDER_DELAY = 600   # Remind every 10 mins if down
+# --- SETTINGS ---
+CHECK_INTERVAL = 5          
+CONTINUOUS_DURATION = 900   
+CONCURRENCY_LIMIT = 6       
+SCHEDULED_INTERVAL = 600    
+DOWN_REMINDER_DELAY = 600   
+
+# FIXED: Set to 7.5 MB to be safe for Standard Discord Servers (Limit is 8MB-10MB)
+MAX_ZIP_SIZE_BYTES = 7.5 * 1024 * 1024 
 
 class DiscordMonitor:
     def __init__(self):
@@ -72,13 +72,14 @@ class DiscordMonitor:
         self.last_down_alert_time: float = 0
         self.rate_limit_remaining = 5
         self.rate_limit_reset = 0
+        self.check_browser = None
+        self.check_page = None
 
     # --- RATE LIMITED DISCORD MESSENGER ---
     async def send_discord_message(self, content: str) -> bool:
         if not DISCORD_WEBHOOK_URL: return False
         
         now = time.time()
-        # Wait if rate limited
         if self.rate_limit_remaining <= 0 and now < self.rate_limit_reset:
             await asyncio.sleep(self.rate_limit_reset - now)
             
@@ -86,12 +87,11 @@ class DiscordMonitor:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(DISCORD_WEBHOOK_URL, json=payload) as resp:
-                    # Update rate limit headers
                     self.rate_limit_remaining = int(resp.headers.get("X-RateLimit-Remaining", 5))
                     reset_after = resp.headers.get("X-RateLimit-Reset-After")
                     if reset_after: self.rate_limit_reset = now + float(reset_after)
                     
-                    if resp.status == 429: # Too Many Requests
+                    if resp.status == 429: 
                         retry = float(resp.headers.get("retry-after", 1))
                         await asyncio.sleep(retry)
                         return await self.send_discord_message(content)
@@ -99,22 +99,45 @@ class DiscordMonitor:
         except:
             return False
 
-    async def send_file(self, filename: str, data: BytesIO) -> bool:
+    async def send_file(self, filename: str, data: BytesIO, content: str = "") -> bool:
+        """
+        Sends a file WITH a message content to ensure context.
+        Includes error printing to debug delivery failures.
+        """
         if not DISCORD_WEBHOOK_URL: return False
+        
         form = aiohttp.FormData()
+        # Reset pointer to start of file
         data.seek(0)
-        form.add_field("file", data, filename=filename, content_type="application/zip")
+        
+        # Add the message text if provided
+        if content:
+            form.add_field("content", content)
+            
         form.add_field("username", "BEU Monitor")
+        # Add the file
+        form.add_field("file", data, filename=filename, content_type="application/zip")
         
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(DISCORD_WEBHOOK_URL, data=form, timeout=600) as resp:
+                    
+                    # Handle Rate Limits
                     if resp.status == 429:
                         retry = float(resp.headers.get("retry-after", 1))
+                        print(f"Rate limited. Waiting {retry}s...")
                         await asyncio.sleep(retry)
-                        return await self.send_file(filename, data)
-                    return resp.status in (200, 204)
-        except:
+                        return await self.send_file(filename, data, content)
+                    
+                    # Debugging for failures
+                    if resp.status not in (200, 204):
+                        error_text = await resp.text()
+                        print(f"❌ Upload Failed! Status: {resp.status} | Response: {error_text}")
+                        return False
+                        
+                    return True
+        except Exception as e:
+            print(f"❌ Exception during upload: {e}")
             return False
 
     # --- SITE LOGIC ---
@@ -129,43 +152,28 @@ class DiscordMonitor:
         return f"https://beu-bih.ac.in/result-three?{urllib.parse.urlencode(params)}"
 
     async def check_connection(self) -> str:
-        """
-        FIXED: Checks if the site is UP by verifying the RegNo exists in the page text.
-        This prevents false positives on maintenance pages.
-        """
         test_reg = REG_LIST[0] 
         canary_url = self.construct_url(test_reg)
-        
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(canary_url, timeout=10) as resp:
-                    if resp.status == 200:
-                        html_content = await resp.text()
-                        
-                        # CRITICAL FIX: 
-                        # Only return "UP" if the Registration No is actually found in the HTML.
-                        if str(test_reg) in html_content:
-                            return "UP"
-                        
-                    return "DOWN"
+            if not self.check_page: return "DOWN"
+            await self.check_page.goto(canary_url, timeout=15000)
+            try:
+                await self.check_page.wait_for_selector(f"text={test_reg}", timeout=5000)
+                return "UP"
+            except:
+                return "DOWN"
         except Exception as e:
             return "DOWN"
 
     async def fetch_student_pdf(self, context, reg_no, semaphore) -> Tuple[str, Optional[bytes]]:
-        """Worker to fetch a single PDF with improved waiting logic"""
         async with semaphore:
             page = await context.new_page()
             try:
                 await page.goto(self.construct_url(reg_no), timeout=40000)
-                
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=10000)
+                    await page.wait_for_selector(f"text={reg_no}", timeout=10000)
                 except:
                     pass 
-                
-                # Gatekeeper: Wait for RegNo to appear in the text (Validates content loaded)
-                await page.wait_for_selector(f"text={reg_no}", timeout=15000)
-
                 pdf = await page.pdf(format="A4", print_background=True)
                 await page.close()
                 return (reg_no, pdf)
@@ -174,98 +182,121 @@ class DiscordMonitor:
                 await page.close()
                 return (reg_no, None)
 
-    async def parallel_download_zip(self) -> BytesIO:
-        """Manages the parallel download"""
-        buffer = BytesIO()
+    async def download_all_pdfs(self) -> List[Tuple[str, Optional[bytes]]]:
+        """Downloads all PDFs and returns them in a list"""
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+            context = await browser.new_context(user_agent="Mozilla/5.0")
             sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
             
             tasks = [self.fetch_student_pdf(context, reg, sem) for reg in REG_LIST]
             results = await asyncio.gather(*tasks)
-            
-            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                count = 0
-                for reg, pdf in results:
-                    if pdf:
-                        zf.writestr(f"Result_{reg}.pdf", pdf)
-                        count += 1
-                    else:
-                        zf.writestr(f"MISSING_{reg}.txt", "Failed to download.")
-            
             await browser.close()
-            print(f"Downloaded {count} results successfully.")
+            return results
+
+    async def chunk_and_upload_results(self, results):
+        """
+        Splits results into multiple ZIPs of ~7.5MB each.
+        """
+        current_idx = 1
+        current_buffer = BytesIO()
+        current_zip = zipfile.ZipFile(current_buffer, "w", zipfile.ZIP_DEFLATED)
         
-        buffer.seek(0)
-        return buffer
+        for reg, pdf in results:
+            if pdf:
+                # Check size before writing
+                if current_buffer.tell() > MAX_ZIP_SIZE_BYTES:
+                    # Finalize current chunk
+                    current_zip.close()
+                    file_size = current_buffer.tell() / (1024*1024)
+                    filename = f"Results_Part{current_idx}.zip"
+                    
+                    # Upload WITH message
+                    msg = f"📦 **Batch {current_idx} Ready** ({file_size:.2f} MB)"
+                    print(f"Uploading {filename}...")
+                    success = await self.send_file(filename, current_buffer, content=msg)
+                    
+                    if not success:
+                        print(f"⚠️ Failed to upload {filename}!")
+
+                    # Reset for next chunk
+                    current_idx += 1
+                    current_buffer = BytesIO()
+                    current_zip = zipfile.ZipFile(current_buffer, "w", zipfile.ZIP_DEFLATED)
+                
+                # Write to current zip
+                current_zip.writestr(f"Result_{reg}.pdf", pdf)
+            else:
+                current_zip.writestr(f"MISSING_{reg}.txt", "Failed to download.")
+
+        # Upload the final remaining chunk
+        if current_buffer.tell() > 0:
+            current_zip.close()
+            file_size = current_buffer.tell() / (1024*1024)
+            filename = f"Results_Part{current_idx}.zip"
+            msg = f"📦 **Final Batch {current_idx} Ready** ({file_size:.2f} MB)"
+            print(f"Uploading {filename}...")
+            await self.send_file(filename, current_buffer, content=msg)
 
     async def continuous_status(self, end_time):
-        """The 'Spam' loop: sends UP status continuously"""
         print("Entering Continuous Status Loop...")
         while time.time() < end_time:
             left = int(end_time - time.time())
             if left <= 0: break
-            
-            # Send message every CHECK_INTERVAL (5s)
             await self.send_discord_message(f"✅ Website still UP ({left}s left)")
             await asyncio.sleep(CHECK_INTERVAL)
 
     # --- MAIN LOOP ---
     async def run(self):
         print(f"Monitor Started. Run Duration: {CONTINUOUS_DURATION}s")
-        await self.send_discord_message("🔍 **Monitor Started** (Checking every 5s)")
+        await self.send_discord_message("🔍 **Monitor Started** (Playwright Check + 7.5MB Split)")
         
-        start_time = time.time()
-        end_time = start_time + CONTINUOUS_DURATION
-        
-        while time.time() < end_time:
-            # 1. Check Status
-            status = await self.check_connection()
-            now = time.time()
+        async with async_playwright() as p:
+            self.check_browser = await p.chromium.launch(headless=True)
+            self.check_page = await self.check_browser.new_context()
+            self.check_page = await self.check_page.new_page()
 
-            # 2. Status Changed Logic
-            if status == "UP":
-                # If it WAS down (or first check), triggering Immediate Action
-                if self.last_status != "UP":
-                    await self.send_discord_message("🚨 **SITE IS LIVE!** Starting Download...")
-                    
-                    # A. Download
-                    zip_data = await self.parallel_download_zip()
-                    zip_size = zip_data.getbuffer().nbytes / (1024*1024)
-                    
-                    # B. Upload
-                    await self.send_discord_message(f"📤 ZIP Generated ({zip_size:.2f} MB). Uploading...")
-                    success = await self.send_file(f"Results_{int(now)}.zip", zip_data)
-                    
-                    if success:
-                        await self.send_discord_message("✅ **Bulk Download Complete & Uploaded**")
-                    else:
-                        await self.send_discord_message("❌ Upload Failed (Check file size limits).")
-
-                    # C. Enter the 'Spam' Loop (Continuous Status)
-                    # This loop runs until time is up, then the script exits
-                    await self.continuous_status(end_time)
-                    return # Exit after continuous loop finishes
-
-            elif status == "DOWN":
-                # Handle Notifications
-                if self.last_status == "UP":
-                    await self.send_discord_message("🔴 Website went **DOWN**")
-                    self.last_down_alert_time = now
-                elif self.last_status is None:
-                    # First check is DOWN
-                    await self.send_discord_message("🔴 Website is currently **DOWN**")
-                    self.last_down_alert_time = now
-                elif (now - self.last_down_alert_time) > DOWN_REMINDER_DELAY:
-                    # Reminder every 10 mins
-                    await self.send_discord_message("🔴 Reminder: Website is still **DOWN**")
-                    self.last_down_alert_time = now
+            start_time = time.time()
+            end_time = start_time + CONTINUOUS_DURATION
             
-            self.last_status = status
+            try:
+                while time.time() < end_time:
+                    status = await self.check_connection()
+                    now = time.time()
+
+                    if status == "UP":
+                        if self.last_status != "UP":
+                            await self.send_discord_message("🚨 **SITE IS LIVE!** Starting Bulk Download...")
+                            
+                            # 1. Download ALL results first
+                            results = await self.download_all_pdfs()
+                            count = sum(1 for _, pdf in results if pdf)
+                            await self.send_discord_message(f"📥 Downloaded {count} PDFs. Compressing...")
+
+                            # 2. Chunk and Upload (Handles 8MB limit)
+                            await self.chunk_and_upload_results(results)
+                            
+                            await self.send_discord_message("✅ **All Batches Uploaded Successfully**")
+                            await self.continuous_status(end_time)
+                            return 
+
+                    elif status == "DOWN":
+                        if self.last_status == "UP":
+                            await self.send_discord_message("🔴 Website went **DOWN**")
+                            self.last_down_alert_time = now
+                        elif self.last_status is None:
+                            await self.send_discord_message("🔴 Website is currently **DOWN**")
+                            self.last_down_alert_time = now
+                        elif (now - self.last_down_alert_time) > DOWN_REMINDER_DELAY:
+                            await self.send_discord_message("🔴 Reminder: Website is still **DOWN**")
+                            self.last_down_alert_time = now
+                    
+                    self.last_status = status
+                    await asyncio.sleep(CHECK_INTERVAL)
             
-            # 3. Wait for next check
-            await asyncio.sleep(CHECK_INTERVAL)
+            finally:
+                if self.check_browser:
+                    await self.check_browser.close()
 
 if __name__ == "__main__":
     asyncio.run(DiscordMonitor().run())
