@@ -5,13 +5,13 @@ import aiohttp
 import zipfile
 import urllib.parse
 from io import BytesIO
-from datetime import datetime
 from typing import Optional, Tuple
 from playwright.async_api import async_playwright
 
 # --- CONFIGURATION ---
 
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+# Ensure this is set in your environment variables or replace with the actual URL string for testing
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") 
 
 EXAM_CONFIG = {
     "ordinal_sem": "6th",
@@ -129,14 +129,26 @@ class DiscordMonitor:
         return f"https://beu-bih.ac.in/result-three?{urllib.parse.urlencode(params)}"
 
     async def check_connection(self) -> str:
-        """Lightweight Check to Canary URL"""
-        canary_url = self.construct_url(REG_LIST[0])
+        """
+        FIXED: Checks if the site is UP by verifying the RegNo exists in the page text.
+        This prevents false positives on maintenance pages.
+        """
+        test_reg = REG_LIST[0] 
+        canary_url = self.construct_url(test_reg)
+        
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(canary_url, timeout=10) as resp:
-                    # If status is 200, the page exists (UP)
-                    return "UP" if resp.status == 200 else "DOWN"
-        except:
+                    if resp.status == 200:
+                        html_content = await resp.text()
+                        
+                        # CRITICAL FIX: 
+                        # Only return "UP" if the Registration No is actually found in the HTML.
+                        if str(test_reg) in html_content:
+                            return "UP"
+                        
+                    return "DOWN"
+        except Exception as e:
             return "DOWN"
 
     async def fetch_student_pdf(self, context, reg_no, semaphore) -> Tuple[str, Optional[bytes]]:
@@ -146,12 +158,10 @@ class DiscordMonitor:
             try:
                 await page.goto(self.construct_url(reg_no), timeout=40000)
                 
-                # --- FIX FOR EMPTY ZIP: Wait for Network Idle ---
-                # This ensures all scripts and data have loaded before we print
                 try:
                     await page.wait_for_load_state("networkidle", timeout=10000)
                 except:
-                    pass # Proceed even if network isn't perfectly idle, selector check is next
+                    pass 
                 
                 # Gatekeeper: Wait for RegNo to appear in the text (Validates content loaded)
                 await page.wait_for_selector(f"text={reg_no}", timeout=15000)
@@ -191,7 +201,7 @@ class DiscordMonitor:
         return buffer
 
     async def continuous_status(self, end_time):
-        """The 'Spam' loop from Code 2: sends UP status continuously"""
+        """The 'Spam' loop: sends UP status continuously"""
         print("Entering Continuous Status Loop...")
         while time.time() < end_time:
             left = int(end_time - time.time())
